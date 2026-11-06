@@ -126,10 +126,15 @@ def stalled_tls_server(ca, response: bytes) -> Iterator[tuple[int, threading.Eve
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ca.issue_cert("127.0.0.1").configure_cert(context)
     listener = socket.create_server(("127.0.0.1", 0))
+    # A test that fails before connecting must not leave the thread blocked in accept().
+    listener.settimeout(5)
     release = threading.Event()
 
     def serve() -> None:
-        raw, _ = listener.accept()
+        try:
+            raw, _ = listener.accept()
+        except TimeoutError:
+            return
         with context.wrap_socket(raw, server_side=True) as conn:
             request = b""
             while b"\r\n\r\n" not in request:
@@ -158,6 +163,10 @@ async def timed_stat(port, ssl_context, protocols, release) -> float:
         return elapsed
 
 
+STALLED_BODY = b"HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: 1000000\r\n\r\n" + b"<" * 1000
+"""A reply whose body never finishes, so its connection is still held when a call ends."""
+
+
 def assert_waited_the_bound(elapsed: float) -> None:
     assert BOUND <= elapsed < BOUND + 2, f"the call took {elapsed:.2f}s"
 
@@ -168,8 +177,7 @@ def test_a_stalled_shutdown_is_aborted_after_the_bound(ca, httpclient_ssl_contex
     exists() never reads the body, so the connection is still held when the call ends and
     the client can reach the transport: once the bound passes, it aborts it.
     """
-    head = b"HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: 1000000\r\n\r\n"
-    with stalled_tls_server(ca, head + b"<" * 1000) as (port, _):
+    with stalled_tls_server(ca, STALLED_BODY) as (port, _):
 
         async def run() -> tuple[float, list[ResponseHandler]]:
             async with Client(f"https://127.0.0.1:{port}/", ssl=httpclient_ssl_context) as client:
@@ -203,3 +211,37 @@ def test_a_call_waits_for_a_redirect_hop_to_close(tls_httpserver, ca, httpclient
     redirect = f"HTTP/1.1 307 Temporary Redirect\r\nLocation: {tls_httpserver.url_for('/foo/bar/')}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode()
     with stalled_tls_server(ca, redirect) as (port, release):
         assert_waited_the_bound(asyncio.run(timed_stat(port, httpclient_ssl_context, protocols, release)))
+
+
+def cancelled_call(port, ssl_context, protocols, call) -> tuple[float, list[ResponseHandler]]:
+    """Start a call on /foo/bar/, cancel it partway, and time how long the cancellation takes."""
+
+    async def run() -> tuple[float, list[ResponseHandler]]:
+        async with Client(f"https://127.0.0.1:{port}/", ssl=ssl_context) as client:
+            task = asyncio.create_task(getattr(client, call)("/foo/bar/"))
+            await asyncio.sleep(0.3)
+            start = time.monotonic()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            elapsed = time.monotonic() - start
+            await asyncio.sleep(0.1)  # an abort's connection_lost lands a few iterations later
+            return elapsed, half_closed(protocols)
+
+    return asyncio.run(run())
+
+
+def test_a_call_cancelled_while_waiting_aborts_at_once(ca, httpclient_ssl_context, protocols):
+    """exists() returns into the wait at once; cancelling it there aborts rather than strands the connection."""
+    with stalled_tls_server(ca, STALLED_BODY) as (port, _):
+        elapsed, unfinished = cancelled_call(port, httpclient_ssl_context, protocols, "exists")
+    assert unfinished == [], "the cancelled call left its connection half-closed"
+    assert elapsed < 0.2, f"cancelling took {elapsed:.2f}s"
+
+
+def test_a_call_already_cancelling_does_not_wait(ca, httpclient_ssl_context, protocols):
+    """list() is stuck reading the body when cancelled, so it reaches the wait already cancelling."""
+    with stalled_tls_server(ca, STALLED_BODY) as (port, _):
+        elapsed, unfinished = cancelled_call(port, httpclient_ssl_context, protocols, "list")
+    assert unfinished == [], "the cancelled call left its connection half-closed"
+    assert elapsed < 0.2, f"cancelling took {elapsed:.2f}s"
