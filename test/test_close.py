@@ -230,17 +230,6 @@ def test_a_stalled_shutdown_is_aborted_without_a_transport(ca, httpclient_ssl_co
     assert_waited_the_bound(elapsed)
 
 
-@pytest.mark.usefixtures("short_bound")
-def test_a_call_waits_for_a_redirect_hop_to_close(tls_httpserver, ca, httpclient_ssl_context, protocols, top_listing_response):
-    """aiohttp closes the connection of a redirect itself, and only the final response reaches the client."""
-    closing_server(tls_httpserver, top_listing_response)
-    redirect = f"HTTP/1.1 307 Temporary Redirect\r\nLocation: {tls_httpserver.url_for('/foo/bar/')}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode()
-    with stalled_tls_server(ca, redirect) as (port, release):
-        elapsed, unfinished = asyncio.run(timed_stat(port, httpclient_ssl_context, protocols, release))
-    assert unfinished == [], "the redirect's stalled connection was not aborted"
-    assert_waited_the_bound(elapsed)
-
-
 def cancelled_call(port, ssl_context, protocols, call) -> tuple[float, list[ResponseHandler]]:
     """Start a call on /foo/bar/, cancel it partway, and time how long the cancellation takes."""
 
@@ -272,35 +261,6 @@ def test_a_call_already_cancelling_does_not_wait(ca, httpclient_ssl_context, pro
         elapsed, unfinished = cancelled_call(port, httpclient_ssl_context, protocols, "list")
     assert unfinished == [], "the cancelled call left its connection half-closed"
     assert elapsed < 0.2, f"cancelling took {elapsed:.2f}s"
-
-
-@pytest.mark.parametrize("own_session", [True, False], ids=["owned session", "passed session"])
-def test_a_redirect_hop_is_settled_when_the_final_hop_fails(ca, httpclient_ssl_context, protocols, own_session):
-    """
-    The hop's connection is still closing when the request it led to fails, before any
-    final response exists for aiohttp to hang the hop's history on. The client follows
-    redirects itself, so it holds every hop's connection whichever session is in use, and
-    a failed call waits for one that is closing. The hop here closes late, after the final
-    hop has already failed, so a call that did not wait would return with it half-closed.
-    """
-    with stalled_tls_server(ca, b"") as (target, hang_up):
-        hang_up.set()  # The target drops the connection as soon as the request is in.
-        redirect = f"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://127.0.0.1:{target}/foo/bar/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        with stalled_tls_server(ca, redirect.encode()) as (port, release):
-            threading.Timer(0.3, release.set).start()
-
-            async def run() -> list[ResponseHandler]:
-                async with aiohttp.ClientSession() as session, Client(f"https://127.0.0.1:{port}/", ssl=httpclient_ssl_context, session=None if own_session else session) as client:
-                    with pytest.raises(aiohttp.ClientError):
-                        await client.stat("/foo/bar/")
-                    unfinished = half_closed(protocols)
-                    await all_closed(protocols)
-                    return unfinished
-
-            unfinished = asyncio.run(run())
-
-    assert protocols, "no connection was made, so this observed nothing"
-    assert protocols[0] not in unfinished, "the redirect hop was left half-closed"
 
 
 def test_a_failed_call_does_not_wait_out_the_bound(ca, httpclient_ssl_context, protocols):
