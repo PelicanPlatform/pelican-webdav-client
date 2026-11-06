@@ -80,7 +80,7 @@ class Client:
     exactly as the server would see them, and encoded here: a "%" in a path is a literal
     percent sign.
 
-    A redirect is followed, as aiohttp would follow it, and the reply is read against the
+    A redirect is followed, by aiohttp's main rules (see _follow()), and the reply is read against the
     URL that finally answered, not the one asked for: a server that redirects one form of
     a resource's URL to another still describes the resource that was asked about.
 
@@ -283,8 +283,7 @@ class Client:
             raise
         finally:
             # Settled together, so a call is still held up by at most twice CLOSE_TIMEOUT.
-            if connections:
-                await asyncio.gather(*(_settle(protocol, transport, outcome, bounded=self._owns_session) for protocol, transport in connections.items()))
+            await asyncio.gather(*(_settle(protocol, transport, outcome, bounded=self._owns_session) for protocol, transport in connections.items()))
 
     async def _follow(self, url: yarl.URL, headers: dict[str, str], timeout: aiohttp.ClientTimeout, connections: dict[ResponseHandler, asyncio.Transport | None]) -> aiohttp.ClientResponse:
         """
@@ -293,11 +292,13 @@ class Client:
         Redirects are followed here rather than by aiohttp so that every hop's response,
         and with it the connection that carried it, goes through `connections`, whatever
         session is in use; aiohttp shows a caller only the hops of a request that got a
-        final response. The rules are aiohttp's: a 301, 302, 307 or 308 with a Location is
-        followed with the same method, to an http or https URL resolved against the one
-        that redirected, and a redirect to another origin drops the Authorization header.
-        A 303 asks for a GET of another resource, which a PROPFIND cannot do, and is
-        returned as it is.
+        final response. The main rules are aiohttp's: a 301, 302, 307 or 308 with a
+        Location is followed with the same method, to an http or https URL resolved against
+        the one that redirected, a redirect to another origin drops the Authorization
+        header, and after MAX_REDIRECTS hops the request gives up. Less used ones are not
+        copied: the Location is taken as sent, without aiohttp's fallback to a URI header
+        or a session's requote_redirect_url setting. A 303 asks for a GET of another
+        resource, which a PROPFIND cannot do, and is returned as it is.
         """
         headers = dict(headers)
         history: list[aiohttp.ClientResponse] = []
@@ -316,7 +317,7 @@ class Client:
             response.release()
             history.append(response)
             if len(history) >= MAX_REDIRECTS:
-                raise aiohttp.TooManyRedirects(response.request_info, tuple(history))
+                raise aiohttp.TooManyRedirects(history[0].request_info, tuple(history))
             try:
                 target = url.join(yarl.URL(location))
                 if target.scheme not in {"http", "https"}:
@@ -400,7 +401,7 @@ def _connector() -> aiohttp.TCPConnector:
     """
     A connector for a session the client creates, whose TLS shutdowns end within CLOSE_TIMEOUT.
 
-    When a reply arrives whole with its headers, or on a redirect hop, aiohttp closes a
+    When a reply arrives whole with its headers, as a redirect usually does, aiohttp closes a
     connection it will not reuse before the client sees the response, so _settle() has no
     transport to abort. With this, asyncio aborts it instead, after the same bound rather
     than its default thirty seconds.

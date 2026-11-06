@@ -187,6 +187,11 @@ def small_reply(listing: str, *, close: bool = True, length: int | None = None) 
     return f"HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {length or len(body)}\r\n{connection}\r\n".encode() + body
 
 
+def redirect_reply(location: str) -> bytes:
+    """A 307 to `location` that arrives whole, so aiohttp releases its connection at once."""
+    return f"HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode()
+
+
 STALLED_BODY = small_reply("<" * 1000, close=False, length=1_000_000)
 """A reply whose body never finishes, so its connection is still held when a call ends."""
 
@@ -232,8 +237,7 @@ def test_a_stalled_shutdown_is_aborted_without_a_transport(server_ssl_context, h
 def test_a_call_waits_for_a_redirect_hop_to_close(tls_httpserver, server_ssl_context, httpclient_ssl_context, protocols, top_listing_response):
     """aiohttp closes the connection of a redirect itself, and only the final response reaches the client."""
     closing_server(tls_httpserver, top_listing_response)
-    redirect = f"HTTP/1.1 307 Temporary Redirect\r\nLocation: {tls_httpserver.url_for('/foo/bar/')}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode()
-    with stalled_tls_server(server_ssl_context, redirect) as (port, release):
+    with stalled_tls_server(server_ssl_context, redirect_reply(tls_httpserver.url_for("/foo/bar/"))) as (port, release):
         elapsed, unfinished = asyncio.run(timed_stat(port, httpclient_ssl_context, protocols, release))
     assert unfinished == [], "the redirect's stalled connection was not aborted"
     assert_waited_the_bound(elapsed)
@@ -284,8 +288,7 @@ def test_a_redirect_hop_is_settled_when_the_final_hop_fails(server_ssl_context, 
     """
     with stalled_tls_server(server_ssl_context, b"") as (target, hang_up):
         hang_up.set()  # The target drops the connection as soon as the request is in.
-        redirect = f"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://127.0.0.1:{target}/foo/bar/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        with stalled_tls_server(server_ssl_context, redirect.encode()) as (port, release):
+        with stalled_tls_server(server_ssl_context, redirect_reply(f"https://127.0.0.1:{target}/foo/bar/")) as (port, release):
             threading.Timer(0.3, release.set).start()
 
             async def run() -> list[ResponseHandler]:
