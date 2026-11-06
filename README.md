@@ -1,31 +1,21 @@
 # pelican-webdav-client
 
-A PROPFIND-only asynchronous WebDAV client for the [Pelican Platform](https://pelicanplatform.org).
+An asynchronous WebDAV client for the [Pelican Platform](https://github.com/PelicanPlatform/pelican) that speaks `PROPFIND` and nothing else.
 
-[PelicanFS](https://github.com/PelicanPlatform/pelicanfs) uses WebDAV for exactly one thing:
-PROPFIND, to list a collection and to tell an object from a collection. This package does
-that and nothing else, on top of [aiohttp](https://docs.aiohttp.org/), so that the WebDAV
-half of PelicanFS depends on code the Pelican project controls.
+It exists to serve [PelicanFS](https://github.com/PelicanPlatform/pelicanfs), which uses WebDAV only to list collections and to tell objects from collections. It does not upload, download, copy, move, delete or lock anything. If you need those, use a general-purpose WebDAV client.
 
-- Python 3.11 and later; `aiohttp` and `yarl` are the only dependencies.
-- Paths are taken percent-decoded and encoded by the client, so a `%` in a name is a
-  literal percent sign. Paths reported back are relative to the client's base URL, so a
-  client rooted at an origin's data endpoint speaks namespace paths throughout.
-- A redirect is followed and the reply is read against the URL that finally answered,
-  so a server that redirects one form of a URL to another still describes the resource
-  asked about.
-- Every response is read or released before a call returns or raises, so a client never
-  holds a connection between calls.
-- Multistatus bodies are parsed with the standard library; a document type declaration is
-  rejected outright, which is how entity-expansion attacks would arrive.
+- Built on `aiohttp`, with no other runtime dependencies
+- XML is parsed with the standard library, and documents that carry a DTD are rejected
+- Requires Python 3.11 or later
+- Fully typed (`py.typed`)
 
-## Install
+## Installation
 
-```
+```sh
 pip install pelican-webdav-client
 ```
 
-## Use
+## Quick start
 
 ```python
 import asyncio
@@ -33,123 +23,121 @@ import asyncio
 from pelican_webdav_client import Client, NotFoundError
 
 
-async def main():
+async def main() -> None:
     async with Client("https://origin.example.org", token="...") as client:
-        # The resources in a collection, without the collection itself
         for resource in await client.list("/namespace/collection"):
-            print(resource.path, resource.is_collection, resource.size, resource.modified)
+            print(resource.name, resource.is_collection, resource.size, resource.modified)
 
-        # One resource
         try:
-            resource = await client.stat("/namespace/collection/object")
+            info = await client.stat("/namespace/collection/file.txt")
         except NotFoundError:
             print("no such object")
         else:
-            print(resource.content_type)
-
-        # Existence by status alone, without parsing the reply
-        print(await client.exists("/namespace/collection/object"))
-
-        # The raw PROPFIND, every entry the server describes
-        print(await client.propfind("/namespace/collection", depth=1))
+            print(info.path, info.size, info.content_type)
 
 
 asyncio.run(main())
 ```
 
-### `Client(base_url, *, token=None, ssl=True, session=None, timeout=None)`
+## The client
 
-`base_url` is the server, with any path prefix the resources live under; paths given to
-the methods are appended to it and paths reported back have it removed. `token` is sent
-as a bearer token on every request. `ssl` and `timeout` are passed to aiohttp unchanged:
-`ssl` takes `True`, `False` or an `ssl.SSLContext`, for example one that trusts a private
-certificate authority. `session` is an `aiohttp.ClientSession` to send requests through;
-without one the client creates its own on first use and closes it in `close()`, and a
-session passed in is left to its owner.
+```python
+Client(
+    base_url: str,
+    *,
+    token: str | None = None,
+    ssl: bool | ssl.SSLContext = True,
+    session: aiohttp.ClientSession | None = None,
+    timeout: aiohttp.ClientTimeout | None = None,
+)
+```
 
-| Method | Request | Returns |
-|---|---|---|
-| `propfind(path, *, depth=0)` | `PROPFIND path`, `Depth: 0`, `1` or `infinity` | every resource in the reply, as `list[Resource]` |
-| `stat(path)` | `PROPFIND path`, `Depth: 0` | the `Resource` for `path`; `NotFoundError` if the reply does not describe it |
-| `list(path)` | `PROPFIND path/`, `Depth: 1` | the resources in the collection, without the collection itself |
-| `is_collection(path)` | as `stat` | `bool` |
-| `exists(path)` | `PROPFIND path`, `Depth: 0` | `True` on any success status, `False` on 404; the body is not read |
-| `close()` | | closes the session, if the client created it |
+| Argument   | Meaning |
+|------------|---------|
+| `base_url` | The server, as an absolute URL, plus any path prefix the resources live under. |
+| `token`    | Sent as `Authorization: Bearer <token>` on every request. |
+| `ssl`      | Passed to aiohttp unchanged: `True` verifies certificates, `False` skips verification, or pass your own `ssl.SSLContext` (for example, one that trusts a private CA). |
+| `session`  | An aiohttp session to send requests through. If you pass one in, you own it and the client leaves it open. If you don't, the client creates its own on first use and closes it in `close()`. |
+| `timeout`  | An `aiohttp.ClientTimeout` for each request. Defaults to the session's timeout. |
 
-`list` always asks for the collection's slash form. The other methods send the path as
-given, trailing slash or not, because a server may answer the two forms differently:
-Pelican origins answer a collection's slash form and reject an object's.
+`Client` is an async context manager, and leaving the `async with` block calls `close()`.
 
-### `Resource`
+### Methods
 
-A frozen dataclass with `path` (decoded, absolute, relative to the client's base URL;
-collections end with `/`), `name` (the final component of the path), `is_collection`,
-`size` (`None` for collections), `modified` (an aware `datetime`, or `None`) and
-`content_type`. A path that a redirect carried outside the base URL is reported whole.
+| Method | Returns | What it does |
+|--------|---------|--------------|
+| `list(path)` | `list[Resource]` | The members of the collection at `path`, without the collection itself. Sends `Depth: 1` to the collection's slash form, so a trailing slash on `path` is optional. |
+| `stat(path)` | `Resource` | What the server says about the resource at `path`. Raises `NotFoundError` on a 404, and also when the reply doesn't describe `path`. |
+| `is_collection(path)` | `bool` | Shorthand for `(await stat(path)).is_collection`. |
+| `exists(path)` | `bool` | Judged from the status code alone: a 404 gives `False`, any success gives `True`, and any other error raises. Unlike `stat`, it doesn't care what the body says. |
+| `propfind(path, *, depth=0)` | `list[Resource]` | The raw result: every resource the server describes in the reply, including the target itself. `depth` is `0`, `1` or `"infinity"`. |
+| `url(path)` | `yarl.URL` | The URL a request for `path` is sent to. |
 
-### Errors
+Every method reads or releases its response before it returns or raises, so the client never holds a connection open between calls.
+
+### Paths
+
+- **Paths go in decoded.** Pass paths as the server should see them, and the client percent-encodes them. `"a b"` is sent as `a%20b`, and a `%` in a path is a literal percent sign (`"100%"` is sent as `100%25`). A missing leading slash is added for you.
+- **Paths are relative to `base_url`.** The client adds `base_url`'s path prefix to each request and strips it from each `Resource.path` it returns. If you root the client at an origin's data endpoint, you can work entirely in namespace paths. A resource the server reports outside the prefix keeps its full path.
+- **Trailing slashes matter.** Pelican origins answer a collection's slash form and reject an object's. `stat`, `exists`, `is_collection` and `propfind` send `path` exactly as given, while `list` always adds the slash.
+- **Redirects are followed.** The reply is matched against the URL that finally answered, so a server that redirects one form of a URL to another still gets a correct `stat` or `list`.
+
+## `Resource`
+
+A frozen dataclass describing one entry in a `PROPFIND` reply.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `path` | `str` | Decoded and relative to `base_url`. Collections end in `/` and nothing else does. |
+| `name` | `str` | The final path component, or `""` for the root (a property). |
+| `is_collection` | `bool` | From `DAV:resourcetype`. |
+| `size` | `int \| None` | From `DAV:getcontentlength`. It is always `None` for a collection, and `None` when the server sent no usable length. |
+| `modified` | `datetime \| None` | From `DAV:getlastmodified`, as a timezone-aware datetime. RFC 1123 and ISO 8601 dates are both accepted, and a date with no zone is taken as UTC. |
+| `content_type` | `str \| None` | From `DAV:getcontenttype`. |
+
+The parser only reads properties from `propstat` blocks with a 2xx status. It accepts `href`s that are relative, path-absolute or full URLs.
+
+## Errors
 
 ```
 WebDavError
-├── ResponseError            .method .url .status .reason .body
+├── ResponseError            the server answered with a 4xx or 5xx status
 │   ├── UnauthorizedError    401
 │   ├── ForbiddenError       403
-│   ├── NotFoundError        404, or a reply that does not describe the path asked about
+│   ├── NotFoundError        404, or a stat() reply that doesn't describe the path
 │   └── MethodNotAllowedError 405
-└── InvalidResponseError     a success whose body is not a multistatus document
+└── InvalidResponseError     a successful reply whose body is not a DAV:multistatus document
 ```
 
-Transport failures are aiohttp's own exceptions and are not wrapped.
+A `ResponseError` has `method`, `url`, `status`, `reason` and `body` attributes (`body` is the decoded response body, where servers usually explain themselves). An `InvalidResponseError` has `method`, `url` and `message`.
 
-## How PelicanFS uses it
+Transport failures such as refused connections, TLS errors and timeouts are not wrapped. They reach you as aiohttp's own exceptions.
 
-PelicanFS builds one client per operation from the collections endpoint's host, the
-bearer token it has discovered for the namespace, and the `verify_ssl` option:
+## Logging
 
-```python
-@asynccontextmanager
-async def get_webdav_client(options):
-    async with Client(options["hostname"], token=options["token"], ssl=options.get("verify_ssl", True)) as client:
-        yield client
-```
-
-Then `ls` is `client.list`, `info` is `client.stat`, `isdir` is `client.is_collection` and
-`exists` is `client.exists`. A `ResponseError` with status 500 from the slash form of a path
-is how an origin says the path is an object, not a collection, and PelicanFS keys on
-`error.status` to tell that apart from a real failure.
-
-On an XRootD origin the object URL is the host plus the namespace path, so a host-only
-`base_url` is enough. A Go origin serves objects under an endpoint prefix such as
-`/api/v1.0/origin/data`, which the director reports as the `collections-url`. Rooting the
-client there, and passing namespace paths, keeps that prefix out of every path the client
-reports, which is what lets `ls` and `info` name entries by paths a caller can hand back
-to `open()`:
-
-```python
-# hostname carries the endpoint prefix, e.g. https://origin.example.org:8443/api/v1.0/origin/data
-async with Client(options["hostname"], token=options["token"], ssl=options.get("verify_ssl", True)) as client:
-    entries = await client.list("/namespace/collection")  # paths come back as /namespace/collection/...
-```
+Requests and response statuses are logged at `DEBUG` level to the `pelican_webdav_client.client` logger. Tokens are never logged.
 
 ## Development
 
-```
-pip install -e . --group testing
+```sh
+git clone https://github.com/PelicanPlatform/pelican-webdav-client
+cd pelican-webdav-client
+python -m venv .venv && source .venv/bin/activate
+pip install -e . --group dev
 pytest
 ```
 
-The tests run against [pytest-httpserver](https://pytest-httpserver.readthedocs.io/) and
-treat every warning as an error, so a session or connection left open fails the run.
+The tests run against a local [`pytest-httpserver`](https://github.com/csernazs/pytest-httpserver), so they need no network access and no Pelican federation. Pytest is set to fail on any warning, which means an unclosed session or connection fails the test that leaked it.
 
-Linting, formatting and type checking are pre-commit hooks, run in CI with
-[prek](https://github.com/j178/prek) and runnable the same way locally:
+Linting, formatting and type checking (ruff, pyright and zizmor for the workflows) run through pre-commit:
 
-```
-pip install prek
-prek run --all-files
+```sh
+pre-commit install
+pre-commit run --all-files
 ```
 
-The tooling mirrors [pelicanfs](https://github.com/PelicanPlatform/pelicanfs): ruff with
-the same rule set, pyright, zizmor over the workflows, a test matrix across the supported
-Pythons and operating systems, and trusted publishing to TestPyPI and PyPI on a GitHub
-release whose tag matches the version in `pyproject.toml`.
+CI runs the same hooks, then runs the test suite on Python 3.11 through 3.15 on Linux, and on 3.11 and 3.15 on macOS and Windows.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
