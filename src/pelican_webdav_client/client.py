@@ -19,6 +19,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -37,12 +38,22 @@ if TYPE_CHECKING:
     from types import TracebackType
     from typing import Self
 
+    from aiohttp.client_proto import ResponseHandler
+
 logger = logging.getLogger(__name__)
 
 METHOD = "PROPFIND"
 
 Depth = Literal[0, 1, "infinity"]
 """The Depth header of a PROPFIND: the resource alone, with its children, or its whole subtree."""
+
+CLOSE_TIMEOUT = 1.0
+"""
+Seconds a call waits for a connection it closed to finish closing, before aborting it.
+
+A TLS connection is not closed until both sides have exchanged close_notify; a peer that
+never answers would otherwise keep the call waiting for asyncio's own shutdown timeout.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +90,9 @@ class Client:
     its owner. The client is an async context manager that closes itself on exit.
 
     Every method reads or releases the response it gets before it returns or raises, so a
-    client never holds a connection between calls. Transport failures are aiohttp's own
+    client never holds a connection between calls. A connection that is not kept for reuse
+    is also closed by then, not merely asked to close: a caller that ends its event loop
+    straight after a call leaves no transport behind. Transport failures are aiohttp's own
     exceptions; an error status from the server is a ResponseError.
     """
 
@@ -233,7 +246,8 @@ class Client:
 
         The response is released when the block ends, so a caller that does not read the
         body still gives the connection back. On an error status the body is read for the
-        error's message, which also leaves the connection clean.
+        error's message, which also leaves the connection clean. Either way, the block
+        ends only once the connection is back in the pool or fully closed; see _settle().
         """
         headers = {"Depth": str(depth)}
         if self._token:
@@ -241,9 +255,64 @@ class Client:
         timeout = self.session.timeout if self._timeout is None else self._timeout
 
         logger.debug("%s %s (Depth: %s)", METHOD, url, depth)
-        async with self.session.request(METHOD, url, headers=headers, ssl=self._ssl, timeout=timeout) as response:
-            logger.debug("%s %s -> %s %s", METHOD, url, response.status, response.reason)
-            if response.status >= 400:
-                body = (await response.read()).decode("utf-8", errors="replace")
-                raise ResponseError.for_status(METHOD, str(url), response.status, response.reason or "", body)
-            yield response
+        protocol: ResponseHandler | None = None
+        transport: asyncio.BaseTransport | None = None
+        try:
+            async with self.session.request(METHOD, url, headers=headers, ssl=self._ssl, timeout=timeout) as response:
+                protocol = _protocol_of(response)
+                transport = protocol.transport if protocol is not None else None
+                logger.debug("%s %s -> %s %s", METHOD, url, response.status, response.reason)
+                if response.status >= 400:
+                    body = (await response.read()).decode("utf-8", errors="replace")
+                    raise ResponseError.for_status(METHOD, str(url), response.status, response.reason or "", body)
+                yield response
+        finally:
+            if protocol is not None:
+                await _settle(protocol, transport)
+
+
+def _protocol_of(response: aiohttp.ClientResponse) -> ResponseHandler | None:
+    """
+    The protocol that carried `response`.
+
+    While the response holds its connection, that is public. But when the whole response
+    arrives with its headers, aiohttp releases the connection before the caller sees the
+    response, and the only handle left is the private _protocol attribute, present
+    throughout aiohttp 3.
+    """
+    connection = response.connection
+    if connection is not None:
+        return connection.protocol
+    return getattr(response, "_protocol", None)
+
+
+async def _settle(protocol: ResponseHandler, transport: asyncio.BaseTransport | None) -> None:
+    """
+    Wait until a released connection is back in the pool or fully closed.
+
+    aiohttp closes a connection it will not reuse by asking its transport to close, which
+    for TLS starts a shutdown that finishes some loop iterations later, or never, if the
+    peer does not answer. Waiting for it here means a caller that closes its event loop
+    straight after a call does not strand a transport. The wait is bounded by
+    CLOSE_TIMEOUT, after which the transport, if it was still reachable, is aborted.
+    """
+    if protocol.transport is not None:
+        return  # Pooled for reuse, or still open: nothing is closing.
+    closed = protocol.closed
+    if closed is None:
+        return  # Already closed, before anything asked to wait for it.
+    if not closed.done():
+        await asyncio.wait({closed}, timeout=CLOSE_TIMEOUT)
+    if not closed.done() and transport is not None:
+        logger.debug("connection did not close within %ss; aborting it", CLOSE_TIMEOUT)
+        transport.abort()
+        await asyncio.wait({closed}, timeout=CLOSE_TIMEOUT)
+    # A connection lost with an error sets that as the future's exception. It is not this
+    # call's concern, but asyncio logs an exception nobody retrieved, and reading the
+    # future here created it, so retrieve it, now or whenever it lands.
+    closed.add_done_callback(_retrieve)
+
+
+def _retrieve(future: asyncio.Future[None]) -> None:
+    if not future.cancelled():
+        future.exception()
