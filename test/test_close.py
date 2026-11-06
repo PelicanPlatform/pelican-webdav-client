@@ -182,10 +182,11 @@ async def timed_stat(port, ssl_context, protocols, release, **client_options) ->
         return elapsed, unfinished
 
 
-def small_closing_reply(listing: str) -> bytes:
-    """A reply that arrives whole with its headers, so aiohttp drops its connection before the client sees it."""
+def small_reply(listing: str, *, close: bool = True) -> bytes:
+    """A reply that arrives whole with its headers, so aiohttp releases its connection before the client sees it."""
     body = listing.encode()
-    return f"HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+    connection = "Connection: close\r\n" if close else ""
+    return f"HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {len(body)}\r\n{connection}\r\n".encode() + body
 
 
 STALLED_BODY = b"HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: 1000000\r\n\r\n" + b"<" * 1000
@@ -223,7 +224,7 @@ def test_a_stalled_shutdown_is_aborted_without_a_transport(ca, httpclient_ssl_co
     the client sees the response, leaving the client no transport to abort. The session the
     client creates bounds the TLS shutdown itself, so asyncio aborts it within the call.
     """
-    with stalled_tls_server(ca, small_closing_reply(top_listing_response)) as (port, release):
+    with stalled_tls_server(ca, small_reply(top_listing_response)) as (port, release):
         elapsed, unfinished = asyncio.run(timed_stat(port, httpclient_ssl_context, protocols, release))
     assert unfinished == [], "the stalled connection was not aborted"
     assert_waited_the_bound(elapsed)
@@ -251,9 +252,8 @@ def cancelled_call(port, ssl_context, protocols, call) -> tuple[float, list[Resp
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            elapsed = time.monotonic() - start
-            await asyncio.sleep(0.1)  # an abort's connection_lost lands a few iterations later
-            return elapsed, half_closed(protocols)
+            # No grace period: the cancellation itself waits for its aborts to land.
+            return time.monotonic() - start, half_closed(protocols)
 
     return asyncio.run(run())
 
@@ -274,24 +274,26 @@ def test_a_call_already_cancelling_does_not_wait(ca, httpclient_ssl_context, pro
     assert elapsed < 0.2, f"cancelling took {elapsed:.2f}s"
 
 
-@pytest.mark.usefixtures("short_bound")
-def test_a_redirect_hop_is_settled_when_the_final_hop_fails(ca, httpclient_ssl_context, protocols):
+@pytest.mark.parametrize("own_session", [True, False], ids=["owned session", "passed session"])
+def test_a_redirect_hop_is_settled_when_the_final_hop_fails(ca, httpclient_ssl_context, protocols, own_session):
     """
-    The redirect's connection is still closing when the request it led to fails, before any
-    final response exists to carry the hop's history. The client records hops as they
-    happen, so the failure still waits for it.
+    The hop's connection is still closing when the request it led to fails, before any
+    final response exists for aiohttp to hang the hop's history on. The client follows
+    redirects itself, so it holds every hop's connection whichever session is in use, and
+    a failed call waits for one that is closing. The hop here closes late, after the final
+    hop has already failed, so a call that did not wait would return with it half-closed.
     """
     with stalled_tls_server(ca, b"") as (target, hang_up):
         hang_up.set()  # The target drops the connection as soon as the request is in.
         redirect = f"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://127.0.0.1:{target}/foo/bar/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         with stalled_tls_server(ca, redirect.encode()) as (port, release):
+            threading.Timer(0.3, release.set).start()
 
             async def run() -> list[ResponseHandler]:
-                async with Client(f"https://127.0.0.1:{port}/", ssl=httpclient_ssl_context) as client:
+                async with aiohttp.ClientSession() as session, Client(f"https://127.0.0.1:{port}/", ssl=httpclient_ssl_context, session=None if own_session else session) as client:
                     with pytest.raises(aiohttp.ClientError):
                         await client.stat("/foo/bar/")
                     unfinished = half_closed(protocols)
-                    release.set()
                     await all_closed(protocols)
                     return unfinished
 
@@ -346,7 +348,7 @@ def test_a_passed_session_does_not_wait_twice_for_nothing(ca, httpclient_ssl_con
     the client nor is bounded by it, so after the first wait there is nothing to wait for.
     """
     monkeypatch.setattr("pelican_webdav_client.client.CLOSE_TIMEOUT", 0.5)
-    with stalled_tls_server(ca, small_closing_reply(top_listing_response)) as (port, release):
+    with stalled_tls_server(ca, small_reply(top_listing_response)) as (port, release):
 
         async def run() -> float:
             async with aiohttp.ClientSession() as session:
@@ -355,5 +357,37 @@ def test_a_passed_session_does_not_wait_twice_for_nothing(ca, httpclient_ssl_con
 
         elapsed = asyncio.run(run())
 
-    # Below the bound is fine: aiohttp before 3.12.11 bounds TLS shutdown itself, at 0.1s.
-    assert elapsed < 0.75, f"the call took {elapsed:.2f}s"
+    assert 0.5 <= elapsed < 0.75, f"the call took {elapsed:.2f}s"
+
+
+def test_close_does_not_wait_for_a_stalled_pooled_connection(ca, httpclient_ssl_context, protocols, top_listing_response):
+    """
+    A kept-alive connection to a peer that never answers close_notify is pooled when the
+    client closes. Nothing will reuse it, so close aborts it rather than waiting the bound.
+    """
+    with stalled_tls_server(ca, small_reply(top_listing_response, close=False)) as (port, _):
+
+        async def run() -> tuple[float, list[ResponseHandler]]:
+            client = Client(f"https://127.0.0.1:{port}/", ssl=httpclient_ssl_context)
+            await client.stat("/foo/bar/")
+            assert [p.is_connected() for p in protocols] == [True], "the connection should have been pooled"
+            start = time.monotonic()
+            await client.close()
+            return time.monotonic() - start, half_closed(protocols)
+
+        elapsed, unfinished = asyncio.run(run())
+
+    assert unfinished == [], "close left the pooled connection half-closed"
+    assert elapsed < 0.5, f"close took {elapsed:.2f}s"
+
+
+def test_the_wait_is_skipped_if_aiohttp_loses_the_closed_future(tls_httpserver, httpclient_ssl_context, top_listing_response, monkeypatch):
+    """The wait rests on an attribute aiohttp added recently; without it a call still works, as before the wait existed."""
+    monkeypatch.delattr(ResponseHandler, "closed")
+    closing_server(tls_httpserver, top_listing_response)
+
+    async def run() -> bool:
+        async with Client(tls_httpserver.url_for("/"), ssl=httpclient_ssl_context) as client:
+            return (await client.stat("/foo/bar/")).is_collection
+
+    assert asyncio.run(run()) is True

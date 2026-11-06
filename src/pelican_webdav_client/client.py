@@ -23,7 +23,6 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import quote, unquote
 
@@ -35,7 +34,7 @@ from .multistatus import MultistatusError, Resource, parse_multistatus, same_pat
 
 if TYPE_CHECKING:
     import ssl
-    from collections.abc import AsyncIterator, Iterable, Mapping
+    from collections.abc import AsyncIterator, Mapping
     from types import TracebackType
     from typing import Self
 
@@ -53,6 +52,12 @@ CLOSE_TIMEOUT = 1.0
 Seconds a call waits for a closing connection before it aborts it, and then again for the
 abort to land: a call is held up by at most twice this. See _settle().
 """
+
+REDIRECTS = frozenset({301, 302, 307, 308})
+"""The statuses a request follows with the same PROPFIND; see Client._follow()."""
+
+MAX_REDIRECTS = 10
+"""How many redirects a request follows before giving up, as aiohttp does."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,9 +80,9 @@ class Client:
     exactly as the server would see them, and encoded here: a "%" in a path is a literal
     percent sign.
 
-    A redirect is followed, and the reply is read against the URL that finally answered,
-    not the one asked for: a server that redirects one form of a resource's URL to another
-    still describes the resource that was asked about.
+    A redirect is followed, as aiohttp would follow it, and the reply is read against the
+    URL that finally answered, not the one asked for: a server that redirects one form of
+    a resource's URL to another still describes the resource that was asked about.
 
     `token`, if given, is sent as a bearer token on every request. `ssl` is handed to
     aiohttp unchanged, so it takes True to verify certificates as usual, False to skip
@@ -88,11 +93,16 @@ class Client:
     creates its own, on first use, and closes it in close(); a session passed in is left to
     its owner. The client is an async context manager that closes itself on exit.
 
-    Every method reads or releases the response it gets before it returns or raises, so a
-    client never holds a connection between calls. Once a response has arrived, a connection
-    that is not kept for reuse has also finished closing by then, or has been given up to
-    twice CLOSE_TIMEOUT to do so. Transport failures are aiohttp's own exceptions; an error
-    status from the server is a ResponseError.
+    Every method reads or releases the responses it gets before it returns or raises, so a
+    client never holds a connection between calls. A connection that is not kept for reuse
+    is also closed by then, not merely closing, or has been given up to twice CLOSE_TIMEOUT
+    to close, with two exceptions. A request that fails before any response arrives leaves
+    a connection aiohttp gives no handle on; in a session the client created it finishes
+    closing on its own within CLOSE_TIMEOUT, but the call does not wait for it. And in a
+    session passed in, a connection aiohttp closed before the client saw its response is
+    waited for but can be neither aborted nor bounded, so a peer that never completes the
+    TLS shutdown leaves it closing. Transport failures are aiohttp's own exceptions; an
+    error status from the server is a ResponseError.
     """
 
     def __init__(
@@ -125,13 +135,10 @@ class Client:
     def session(self) -> aiohttp.ClientSession:
         """
         The session requests go through. Created on first use if none was passed in, with
-        TLS shutdowns bounded by CLOSE_TIMEOUT and redirect hops recorded; see _connector()
-        and _record_hop().
+        TLS shutdowns bounded by CLOSE_TIMEOUT; see _connector().
         """
         if self._session is None:
-            hops = aiohttp.TraceConfig()
-            hops.on_request_redirect.append(_record_hop)
-            self._session = aiohttp.ClientSession(connector=_connector(), trace_configs=[hops])
+            self._session = aiohttp.ClientSession(connector=_connector())
         return self._session
 
     def url(self, path: str) -> yarl.URL:
@@ -213,6 +220,9 @@ class Client:
         Close the session, if this client created it.
         """
         if self._owns_session and self._session is not None:
+            # Nothing will reuse the pooled connections now, so have aiohttp abort their TLS
+            # shutdowns at close rather than wait out the bound, as its own default does.
+            _set_ssl_shutdown_timeout(self._session.connector, 0)
             await self._session.close()
             self._session = None
 
@@ -257,16 +267,10 @@ class Client:
             headers["Authorization"] = f"Bearer {self._token}"
         timeout = self.session.timeout if self._timeout is None else self._timeout
 
-        logger.debug("%s %s (Depth: %s)", METHOD, url, depth)
-        # Redirect hops, recorded as they happen in a session the client created, so that a
-        # request that fails after a redirect still settles them; see _record_hop().
-        hops: list[aiohttp.ClientResponse] = []
         connections: dict[ResponseHandler, asyncio.Transport | None] = {}
         outcome: _Outcome = "failed"
         try:
-            async with self.session.request(METHOD, url, headers=headers, ssl=self._ssl, timeout=timeout, trace_request_ctx=hops if self._owns_session else None) as response:
-                connections = _connections((*response.history, response))
-                logger.debug("%s %s -> %s %s", METHOD, url, response.status, response.reason)
+            async with await self._follow(url, headers, timeout, connections) as response:
                 if response.status >= 400:
                     body = (await response.read()).decode("utf-8", errors="replace")
                     raise ResponseError.for_status(METHOD, str(url), response.status, response.reason or "", body)
@@ -278,32 +282,61 @@ class Client:
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
-        except aiohttp.ClientResponseError as err:
-            hops.extend(err.history)  # TooManyRedirects carries every hop, in any session.
-            raise
         finally:
-            await _settle({**_connections(hops), **connections}, outcome, bounded=self._owns_session)
+            await _settle(connections, outcome, bounded=self._owns_session)
+
+    async def _follow(self, url: yarl.URL, headers: dict[str, str], timeout: aiohttp.ClientTimeout, connections: dict[ResponseHandler, asyncio.Transport | None]) -> aiohttp.ClientResponse:
+        """
+        Send a PROPFIND to `url`, follow its redirects, and return the response that ends them.
+
+        Redirects are followed here rather than by aiohttp so that every hop's response,
+        and with it the connection that carried it, goes through `connections`, whatever
+        session is in use; aiohttp shows a caller only the hops of a request that got a
+        final response. The rules are aiohttp's: a 301, 302, 307 or 308 with a Location is
+        followed with the same method, to an http or https URL resolved against the one
+        that redirected, and a redirect to another origin drops the Authorization header.
+        A 303 asks for a GET of another resource, which a PROPFIND cannot do, and is
+        returned as it is.
+        """
+        headers = dict(headers)
+        history: list[aiohttp.ClientResponse] = []
+        while True:
+            logger.debug("%s %s (Depth: %s)", METHOD, url, headers["Depth"])
+            response = await self.session.request(METHOD, url, headers=headers, ssl=self._ssl, timeout=timeout, allow_redirects=False)
+            _record(connections, response)
+            logger.debug("%s %s -> %s %s", METHOD, url, response.status, response.reason)
+            location = response.headers.get("Location") if response.status in REDIRECTS else None
+            if location is None:
+                return response
+            response.release()
+            history.append(response)
+            if len(history) >= MAX_REDIRECTS:
+                raise aiohttp.TooManyRedirects(response.request_info, tuple(history))
+            try:
+                target = url.join(yarl.URL(location))
+                if target.scheme not in {"http", "https"}:
+                    raise aiohttp.NonHttpUrlRedirectClientError(location)
+                if target.origin() != url.origin():
+                    headers.pop("Authorization", None)
+            except ValueError as err:
+                raise aiohttp.InvalidUrlRedirectClientError(location, str(err)) from err
+            url = target
 
 
 _Outcome = Literal["settled", "failed", "cancelled"]
 """How a request ended: with a response from the server, with an error, or cancelled."""
 
 
-def _connections(responses: Iterable[aiohttp.ClientResponse]) -> dict[ResponseHandler, asyncio.Transport | None]:
+def _record(connections: dict[ResponseHandler, asyncio.Transport | None], response: aiohttp.ClientResponse) -> None:
     """
-    The protocols that carried `responses`, each with the transport it has now.
+    Add the protocol that carried `response`, with the transport it has now.
 
-    aiohttp may have released a connection already, so response.connection does not do.
+    aiohttp may have released the connection already, so response.connection does not do.
     _protocol is private: if it ever goes, the wait is skipped rather than failing.
     """
-    return {p: p.transport for r in responses if (p := getattr(r, "_protocol", None)) is not None}
-
-
-async def _record_hop(_session: aiohttp.ClientSession, context: SimpleNamespace, params: aiohttp.TraceRequestRedirectParams) -> None:
-    """Add a redirect's response to the list the request passed as its trace_request_ctx."""
-    hops = context.trace_request_ctx
-    if isinstance(hops, list):
-        hops.append(params.response)
+    protocol = getattr(response, "_protocol", None)
+    if protocol is not None:
+        connections.setdefault(protocol, protocol.transport)
 
 
 async def _settle(connections: dict[ResponseHandler, asyncio.Transport | None], outcome: _Outcome, *, bounded: bool) -> None:
@@ -323,39 +356,45 @@ async def _settle(connections: dict[ResponseHandler, asyncio.Transport | None], 
     After a response ("settled"), a connection gets CLOSE_TIMEOUT to close. One still
     closing is then aborted, and the call waits up to CLOSE_TIMEOUT again for whatever can
     still finish: what it aborted, and, if bounded, the rest. A call is held up by at most
-    twice CLOSE_TIMEOUT. After a failure, the connection is broken and the caller's own
-    timeout may be spent, so it is aborted at once and only the wait for what can still
-    finish remains, at most CLOSE_TIMEOUT. A cancelled call aborts and waits only for its
-    aborts to land, a few loop iterations; a second cancellation then finds them done.
+    twice CLOSE_TIMEOUT. After a failure, the caller's own timeout may be spent, so what
+    can be aborted is aborted at once and a single wait of up to CLOSE_TIMEOUT remains, for
+    everything still closing. A cancelled call, whether cancelled before or during the
+    wait, aborts what it can and waits only for those aborts to land, a few loop
+    iterations, before the cancellation goes on.
 
     A request that fails before its final response arrives (a timeout or reset while
     awaiting the headers) leaves that last connection out of reach: aiohttp gives no handle
     on it, and it finishes closing within the session's TLS shutdown timeout.
     """
-    closing = {
-        closed: transport
-        for protocol, transport in connections.items()
-        # Reading `closed` creates the future, so check the pooled case first.
-        if protocol.transport is None and (closed := protocol.closed) is not None
-    }
+    closing: dict[asyncio.Future[None], asyncio.Transport | None] = {}
+    for protocol, transport in connections.items():
+        # Reading `closed` creates the future, so check the pooled case first. `closed` is
+        # recent (aiohttp 3.13): if it is not there, the wait is skipped rather than failing.
+        if protocol.transport is None and (closed := getattr(protocol, "closed", None)) is not None:
+            closing[closed] = transport
     if not closing:
         return
     # gather also retrieves a lost connection's error, which asyncio would otherwise log.
     settled = asyncio.gather(*closing, return_exceptions=True)
+    cancelled: asyncio.CancelledError | None = None
     if outcome == "settled":
         try:
             await asyncio.wait({settled}, timeout=CLOSE_TIMEOUT)
-        except asyncio.CancelledError:
-            _abort(closing)
-            raise
-        if settled.done():
-            return
-        logger.debug("%d connection(s) did not close within %ss; aborting", sum(not f.done() for f in closing), CLOSE_TIMEOUT)
+        except asyncio.CancelledError as err:
+            cancelled, outcome = err, "cancelled"
+        else:
+            if settled.done():
+                return
+            logger.debug("%d connection(s) did not close within %ss; aborting", sum(not f.done() for f in closing), CLOSE_TIMEOUT)
     aborted = _abort(closing)
     pending = {future for future in closing if not future.done()}
-    finishing = pending if bounded and outcome != "cancelled" else pending & aborted
+    # After a failure nothing has been waited for yet, and in a bounded session asyncio will
+    # finish the rest; otherwise only what was aborted can still finish.
+    finishing = pending if outcome == "failed" or (outcome == "settled" and bounded) else pending & aborted
     if finishing:
         await asyncio.wait(finishing, timeout=CLOSE_TIMEOUT)
+    if cancelled is not None:
+        raise cancelled
 
 
 def _abort(closing: Mapping[asyncio.Future[None], asyncio.Transport | None]) -> set[asyncio.Future[None]]:
@@ -370,20 +409,27 @@ def _abort(closing: Mapping[asyncio.Future[None], asyncio.Transport | None]) -> 
 
 def _connector() -> aiohttp.TCPConnector:
     """
-    A connector for a session the client creates, whose TLS shutdowns abort after CLOSE_TIMEOUT.
+    A connector for a session the client creates, whose TLS shutdowns end within CLOSE_TIMEOUT.
 
     When a reply arrives whole with its headers, or on a redirect hop, aiohttp closes a
     connection it will not reuse before the client sees the response, so _settle() has no
     transport to abort. With this, asyncio aborts it instead, after the same bound rather
     than its default thirty seconds.
+    """
+    connector = aiohttp.TCPConnector()
+    _set_ssl_shutdown_timeout(connector, CLOSE_TIMEOUT)
+    return connector
+
+
+def _set_ssl_shutdown_timeout(connector: aiohttp.BaseConnector | None, seconds: float) -> None:
+    """
+    Set the TLS shutdown bound of `connector`, if it has one.
 
     The public ssl_shutdown_timeout parameter warns of its removal in aiohttp 4.0, and
     silencing that needs warnings.catch_warnings(), which changes process-wide state and is
     not thread safe. The connector's own attribute, read at each connection and present
-    since 3.12.6, sets the same thing without a warning; if a release drops it, the session
-    falls back to aiohttp's default.
+    throughout the supported releases, sets the same thing without a warning; if a release
+    drops it, the session keeps aiohttp's default.
     """
-    connector = aiohttp.TCPConnector()
-    if hasattr(connector, "_ssl_shutdown_timeout"):
-        connector._ssl_shutdown_timeout = CLOSE_TIMEOUT
-    return connector
+    if connector is not None and hasattr(connector, "_ssl_shutdown_timeout"):
+        connector._ssl_shutdown_timeout = seconds
