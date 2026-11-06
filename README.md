@@ -57,7 +57,7 @@ Client(
 | `base_url` | The server, as an absolute URL, plus any path prefix the resources live under. |
 | `token`    | Sent as `Authorization: Bearer <token>` on every request. |
 | `ssl`      | Passed to aiohttp unchanged: `True` verifies certificates, `False` skips verification, or pass your own `ssl.SSLContext` (for example, one that trusts a private CA). |
-| `session`  | An aiohttp session to send requests through. If you pass one in, you own it and the client leaves it open. If you don't, the client creates its own on first use and closes it in `close()`. |
+| `session`  | An aiohttp session to send requests through. If you pass one in, you own it and the client leaves it open; create it with `trace_configs=[trace_config()]` so calls also wait for the connections of the redirects aiohttp follows. If you don't, the client creates its own on first use and closes it in `close()`. |
 | `timeout`  | An `aiohttp.ClientTimeout` for each request. Defaults to the session's timeout. |
 
 `Client` is an async context manager, and leaving the `async with` block calls `close()`.
@@ -73,7 +73,15 @@ Client(
 | `propfind(path, *, depth=0)` | `list[Resource]` | The raw result: every resource the server describes in the reply, including the target itself. `depth` is `0`, `1` or `"infinity"`. |
 | `url(path)` | `yarl.URL` | The URL a request for `path` is sent to. |
 
-Every method reads or releases its response before it returns or raises, so the client never holds a connection open between calls.
+Every method reads or releases its response before it returns or raises, so the client never holds a connection open between calls. A connection that won't be reused is also closed by the time the call returns, including those of any redirects aiohttp followed, provided the session carries `trace_config()`:
+
+```python
+from pelican_webdav_client import Client, trace_config
+
+async with aiohttp.ClientSession(trace_configs=[trace_config()]) as session:
+    async with Client("https://origin.example.org", session=session) as client:
+        ...
+```
 
 ### Paths
 

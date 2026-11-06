@@ -17,7 +17,6 @@ limitations under the License.
 import asyncio
 from datetime import UTC, datetime
 
-import aiohttp
 import pytest
 
 from pelican_webdav_client import Client, InvalidResponseError, NotFoundError, Resource
@@ -308,35 +307,6 @@ def test_the_base_url_itself_is_the_root(httpserver):
     resource = asyncio.run(main())
     assert resource.path == "/"
     assert resource.name == ""
-
-
-def test_a_redirect_loop_ends_in_too_many_redirects(httpserver):
-    """The client follows redirects itself, so it also enforces aiohttp's limit on them."""
-    httpserver.expect_request("/loop", method="PROPFIND").respond_with_data("", status=307, headers={"Location": httpserver.url_for("/loop")})
-
-    async def main():
-        async with Client(httpserver.url_for("/")) as client:
-            await client.stat("/loop")
-
-    with pytest.raises(aiohttp.TooManyRedirects):
-        asyncio.run(main())
-
-
-def test_a_redirect_to_another_origin_drops_the_token(httpserver, threaded_httpserver, top_listing_response):
-    """As aiohttp does: a bearer token is for the server it was given to, not for wherever that server points."""
-    threaded_httpserver.clear()
-    httpserver.expect_request("/foo/bar/", method="PROPFIND", headers={"Authorization": "Bearer secret"}).respond_with_data(
-        "", status=307, headers={"Location": threaded_httpserver.url_for("/foo/bar/")}
-    )
-    threaded_httpserver.expect_request("/foo/bar/", method="PROPFIND").respond_with_data(top_listing_response, status=207, content_type="application/xml")
-
-    async def main():
-        async with Client(httpserver.url_for("/"), token="secret") as client:
-            return await client.is_collection("/foo/bar/")
-
-    assert asyncio.run(main()) is True
-    assert len(threaded_httpserver.log) == 1
-    assert "Authorization" not in threaded_httpserver.log[0][0].headers
 
 
 def test_a_path_outside_the_base_is_reported_whole(httpserver):

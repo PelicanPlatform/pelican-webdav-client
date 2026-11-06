@@ -33,7 +33,7 @@ from aiohttp import web
 from aiohttp.client_proto import ResponseHandler
 from aiohttp.test_utils import TestServer
 
-from pelican_webdav_client import Client, NotFoundError
+from pelican_webdav_client import Client, NotFoundError, trace_config
 
 BOUND = 0.1
 """Stands in for CLOSE_TIMEOUT, so a test of a stalled peer does not wait a full second."""
@@ -281,9 +281,9 @@ def test_a_cancelled_call_aborts_at_once(server_ssl_context, httpclient_ssl_cont
 def test_a_redirect_hop_is_settled_when_the_final_hop_fails(server_ssl_context, httpclient_ssl_context, protocols, own_session):
     """
     The hop's connection is still closing when the request it led to fails, before any
-    final response exists for aiohttp to hang the hop's history on. The client follows
-    redirects itself, so it holds every hop's connection whichever session is in use, and
-    a failed call waits for one that is closing. The hop here closes late, after the final
+    final response exists for aiohttp to hang the hop's history on. trace_config() hands
+    the client each hop as aiohttp follows it, in its own session or one passed in that
+    carries it, so a failed call waits for one that is closing. The hop here closes late, after the final
     hop has already failed, so a call that did not wait would return with it half-closed.
     """
     with stalled_tls_server(server_ssl_context, b"") as (target, hang_up):
@@ -292,7 +292,10 @@ def test_a_redirect_hop_is_settled_when_the_final_hop_fails(server_ssl_context, 
             threading.Timer(0.3, release.set).start()
 
             async def run() -> list[ResponseHandler]:
-                async with aiohttp.ClientSession() as session, Client(f"https://127.0.0.1:{port}/", ssl=httpclient_ssl_context, session=None if own_session else session) as client:
+                async with (
+                    aiohttp.ClientSession(trace_configs=[trace_config()]) as session,
+                    Client(f"https://127.0.0.1:{port}/", ssl=httpclient_ssl_context, session=None if own_session else session) as client,
+                ):
                     with pytest.raises(aiohttp.ClientError):
                         await client.stat("/foo/bar/")
                     unfinished = half_closed(protocols)
