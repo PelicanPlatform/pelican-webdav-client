@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio
-
 #
 # The client must never hold a connection between calls. These tests are the ones pelicanfs
 # needed to guard its workaround for aiowebdav2, which left responses unreleased; here they
 # guard the client itself, which reads or releases every response before it returns.
 #
+import asyncio
 import gc
 from contextlib import contextmanager
 

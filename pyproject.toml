@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pelican-webdav-client"
-version = "0.1.0-rc.0"
+dynamic = ["version"]
 description = "A PROPFIND-only asynchronous WebDAV client for the Pelican Platform"
 readme = "README.md"
 license = "Apache-2.0"
@@ -36,6 +36,9 @@ dependencies = [
 Source = "https://github.com/PelicanPlatform/pelican-webdav-client"
 Pelican-Source = "https://github.com/PelicanPlatform/pelican"
 Bug-Reports = "https://github.com/PelicanPlatform/pelican-webdav-client/issues"
+
+[tool.hatch.version]
+path = "src/pelican_webdav_client/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 exclude = ["/.github"]
@@ -107,3 +110,14 @@ ignore-variadic-names = true
 
 [tool.ruff.lint.per-file-ignores]
 "test/**" = ["ANN", "ARG001", "PLC0415", "T20"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+reportMissingImports = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportIncompatibleMethodOverride = false
+reportAttributeAccessIssue = "warning"

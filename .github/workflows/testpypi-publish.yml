@@ -31,11 +31,11 @@ jobs:
     - name: Verify tag matches package version
       run: |
         TAG="${GITHUB_REF_NAME#v}"
-        PKG_VERSION="$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"(.*)".*/\1/')"
+        PKG_VERSION="$(pipx run hatchling version)"
         echo "Release tag: ${TAG}"
-        echo "pyproject.toml version: ${PKG_VERSION}"
+        echo "Package version: ${PKG_VERSION}"
         if [ "${TAG}" != "${PKG_VERSION}" ]; then
-          echo "::error::Release tag (${TAG}) does not match pyproject.toml version (${PKG_VERSION})."
+          echo "::error::Release tag (${TAG}) does not match the package version (${PKG_VERSION})."
           exit 1
         fi
     - name: Install pypa/build

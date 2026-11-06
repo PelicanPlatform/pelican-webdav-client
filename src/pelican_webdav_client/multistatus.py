@@ -202,11 +202,11 @@ def _status_ok(status: str | None) -> bool:
 
 def _href_path(href: str, request_path: str) -> str:
     """
-    The decoded absolute path `href` names. Only an href with a scheme or authority is
-    split; a bare path is taken whole, so a colon in a name is not read as a scheme.
+    The decoded absolute path `href` names. Only an href with an authority is split; a
+    bare path is taken whole, so a colon in a name is not read as a scheme.
     """
     parts = urlsplit(href)
-    path = parts.path if parts.scheme or parts.netloc else href
+    path = parts.path if parts.netloc else href
     path = unquote(path)
     if not path.startswith("/"):
         # Relative to the request-URI, per RFC 4918 section 8.3

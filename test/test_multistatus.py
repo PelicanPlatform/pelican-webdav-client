@@ -70,8 +70,8 @@ def test_relative_href_is_resolved_against_the_request_path():
 
 
 def test_colon_in_a_name_is_not_a_scheme():
-    body = multistatus(response("/foo/time:12:00.txt", ""))
-    assert parse_multistatus(body)[0].path == "/foo/time:12:00.txt"
+    body = multistatus(response("/foo/time:12:00.txt", ""), response("time:12:00.txt", ""))
+    assert [resource.path for resource in parse_multistatus(body, "/foo/")] == ["/foo/time:12:00.txt", "/foo/time:12:00.txt"]
 
 
 def test_failed_propstat_is_ignored():
