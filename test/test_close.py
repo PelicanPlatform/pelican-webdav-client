@@ -38,6 +38,12 @@ from pelican_webdav_client import Client, NotFoundError, trace_config
 BOUND = 0.1
 """Stands in for CLOSE_TIMEOUT, so a test of a stalled peer does not wait a full second."""
 
+TICK = time.get_clock_info("monotonic").resolution
+"""
+How early asyncio may run a timer, and so end a wait: it runs any timer due within one tick
+of the clock. That is 15.6ms on Windows, enough to make a 0.1s wait measure 0.094s.
+"""
+
 
 @pytest.fixture(name="protocols")
 def fixture_protocols(monkeypatch: pytest.MonkeyPatch) -> list[ResponseHandler]:
@@ -197,7 +203,7 @@ STALLED_BODY = small_reply("<" * 1000, close=False, length=1_000_000)
 
 
 def assert_waited_the_bound(elapsed: float) -> None:
-    assert BOUND <= elapsed < BOUND + 2, f"the call took {elapsed:.2f}s"
+    assert BOUND - TICK <= elapsed < BOUND + 2, f"the call took {elapsed:.2f}s"
 
 
 @pytest.mark.usefixtures("short_bound")
@@ -362,7 +368,7 @@ def test_a_passed_session_does_not_wait_twice_for_nothing(server_ssl_context, ht
 
         elapsed = asyncio.run(run())
 
-    assert 0.5 <= elapsed < 0.75, f"the call took {elapsed:.2f}s"
+    assert 0.5 - TICK <= elapsed < 0.75, f"the call took {elapsed:.2f}s"
 
 
 def test_close_does_not_wait_for_a_stalled_pooled_connection(server_ssl_context, httpclient_ssl_context, protocols, top_listing_response):
