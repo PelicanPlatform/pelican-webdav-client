@@ -62,12 +62,18 @@ def fixture_httpclient_ssl_context(ca):
         return ssl.create_default_context(cafile=ca_temp_path)
 
 
-@pytest.fixture(scope="session", name="tls_httpserver")
-def fixture_tls_httpserver(ca):
-    """An https server with a certificate signed by `ca`. Call clear() before use."""
+@pytest.fixture(scope="session", name="server_ssl_context")
+def fixture_server_ssl_context(ca):
+    """A server-side context with a certificate for localhost and 127.0.0.1, signed by `ca`."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ca.issue_cert("localhost", "127.0.0.1").configure_cert(context)
-    server = _server(ssl_context=context)
+    return context
+
+
+@pytest.fixture(scope="session", name="tls_httpserver")
+def fixture_tls_httpserver(server_ssl_context):
+    """An https server with a certificate signed by `ca`. Call clear() before use."""
+    server = _server(ssl_context=server_ssl_context)
     yield server
     server.clear()
     if server.is_running():
