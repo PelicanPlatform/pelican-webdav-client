@@ -34,7 +34,7 @@ from .multistatus import MultistatusError, Resource, parse_multistatus, same_pat
 
 if TYPE_CHECKING:
     import ssl
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncIterator
     from types import TracebackType
     from typing import Self
 
@@ -255,7 +255,7 @@ class Client:
         The response is released when the block ends, so a caller that does not read the
         body still gives the connection back. On an error status the body is read for the
         error's message, which also leaves the connection clean. Either way, the block
-        waits for every connection the request used to settle; see _settle().
+        waits for the response's connection to settle; see _settle().
         """
         headers = {"Depth": str(depth)}
         if self._token:
@@ -263,110 +263,97 @@ class Client:
         timeout = self.session.timeout if self._timeout is None else self._timeout
 
         logger.debug("%s %s (Depth: %s)", METHOD, url, depth)
-        connections: dict[ResponseHandler, asyncio.Transport | None] = {}
+        protocol: ResponseHandler | None = None
+        transport: asyncio.Transport | None = None
         outcome: _Outcome = "failed"
         try:
             async with self.session.request(METHOD, url, headers=headers, ssl=self._ssl, timeout=timeout) as response:
-                _record(connections, response)
+                # aiohttp may have released the connection already, so response.connection does
+                # not do. _protocol is private: if it ever goes, the wait is skipped, not failed.
+                protocol = getattr(response, "_protocol", None)
+                transport = protocol.transport if protocol is not None else None
                 logger.debug("%s %s -> %s %s", METHOD, url, response.status, response.reason)
                 if response.status >= 400:
                     body = (await response.read()).decode("utf-8", errors="replace")
+                    outcome = "settled"  # The server answered; the connection closes as usual.
                     raise ResponseError.for_status(METHOD, str(url), response.status, response.reason or "", body)
                 yield response
             outcome = "settled"
-        except ResponseError:
-            outcome = "settled"  # The server answered; the connection closes as usual.
-            raise
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
         finally:
-            await _settle(connections, outcome, bounded=self._owns_session)
+            if protocol is not None:
+                await _settle(protocol, transport, outcome, bounded=self._owns_session)
 
 
 _Outcome = Literal["settled", "failed", "cancelled"]
 """How a request ended: with a response from the server, with an error, or cancelled."""
 
 
-def _record(connections: dict[ResponseHandler, asyncio.Transport | None], response: aiohttp.ClientResponse) -> None:
+async def _settle(protocol: ResponseHandler, transport: asyncio.Transport | None, outcome: _Outcome, *, bounded: bool) -> None:
     """
-    Add the protocol that carried `response`, with the transport it has now.
-
-    aiohttp may have released the connection already, so response.connection does not do.
-    _protocol is private: if it ever goes, the wait is skipped rather than failing.
-    """
-    protocol = getattr(response, "_protocol", None)
-    if protocol is not None:
-        connections.setdefault(protocol, protocol.transport)
-
-
-async def _settle(connections: dict[ResponseHandler, asyncio.Transport | None], outcome: _Outcome, *, bounded: bool) -> None:
-    """
-    Wait until released connections are back in the pool or fully closed.
+    Wait until a released connection is back in the pool or fully closed.
 
     aiohttp closes a connection it will not reuse by asking its transport to close, which
     for TLS starts a shutdown that ends some loop iterations later, or never, if the peer
     does not answer. A caller that closes its event loop before then, as fsspec's sync
     wrappers and asyncio.run() do, strands the transport.
 
-    `connections` maps each protocol to the transport it had when its response arrived; a
-    protocol whose transport aiohttp had already dropped maps to None and cannot be aborted
-    here. `bounded` says the session is one the client created, whose TLS shutdowns asyncio
-    aborts itself after CLOSE_TIMEOUT (see _connector()), so waiting for those ends too.
+    `transport` is the one the protocol had when its response arrived, or None if aiohttp
+    had already dropped it, in which case it cannot be aborted here. `bounded` says the
+    session is one the client created, whose TLS shutdowns asyncio aborts itself after
+    CLOSE_TIMEOUT (see _connector()), so waiting for one ends either way.
 
-    After a response ("settled"), a connection gets CLOSE_TIMEOUT to close. One still
-    closing is then aborted, and the call waits up to CLOSE_TIMEOUT again for whatever can
-    still finish: what it aborted, and, if bounded, the rest. A call is held up by at most
-    twice CLOSE_TIMEOUT. After a failure, the caller's own timeout may be spent, so what
-    can be aborted is aborted at once and a single wait of up to CLOSE_TIMEOUT remains, for
-    everything still closing. A cancelled call, whether cancelled before or during the
-    wait, aborts what it can and waits only for those aborts to land, a few loop
-    iterations, before the cancellation goes on.
+    After a response ("settled"), the connection gets CLOSE_TIMEOUT to close. If it is
+    still closing, it is aborted, and the call waits up to CLOSE_TIMEOUT again if it can
+    still finish: if it was aborted, or the session is bounded. A call is held up by at
+    most twice CLOSE_TIMEOUT. After a failure, the caller's own timeout may be spent, so
+    the connection is aborted at once if it can be, and a single wait of up to
+    CLOSE_TIMEOUT remains. A cancelled call, whether cancelled before or during the wait,
+    aborts what it can and waits only for that abort to land, a few loop iterations,
+    before the cancellation goes on.
 
     A request that fails before its response arrives (a timeout or reset while awaiting
     the headers) leaves its connection out of reach, as are the connections of any
     redirects aiohttp followed on the way: it gives no handle on them, and they finish
     closing within the session's TLS shutdown timeout.
     """
-    closing: dict[asyncio.Future[None], asyncio.Transport | None] = {}
-    for protocol, transport in connections.items():
-        # Reading `closed` creates the future, so check the pooled case first. `closed` is
-        # recent (aiohttp 3.13): if it is not there, the wait is skipped rather than failing.
-        if protocol.transport is None and (closed := getattr(protocol, "closed", None)) is not None:
-            closing[closed] = transport
-    if not closing:
+    # Reading `closed` creates the future, so check the pooled case first. `closed` is
+    # recent (aiohttp 3.13): if it is not there, the wait is skipped rather than failing.
+    if protocol.transport is not None:
         return
-    # gather also retrieves a lost connection's error, which asyncio would otherwise log.
-    settled = asyncio.gather(*closing, return_exceptions=True)
+    closed = getattr(protocol, "closed", None)
+    if closed is None:
+        return
+    # A connection lost with an error sets it on the future, which asyncio logs if nobody
+    # retrieves it; reading the future above created it, so retrieve it whenever it lands.
+    closed.add_done_callback(_retrieve)
     cancelled: asyncio.CancelledError | None = None
     if outcome == "settled":
         try:
-            await asyncio.wait({settled}, timeout=CLOSE_TIMEOUT)
+            await asyncio.wait({closed}, timeout=CLOSE_TIMEOUT)
         except asyncio.CancelledError as err:
             cancelled, outcome = err, "cancelled"
         else:
-            if settled.done():
+            if closed.done():
                 return
-            logger.debug("%d connection(s) did not close within %ss; aborting", sum(not f.done() for f in closing), CLOSE_TIMEOUT)
-    aborted = _abort(closing)
-    pending = {future for future in closing if not future.done()}
-    # After a failure nothing has been waited for yet, and in a bounded session asyncio will
-    # finish the rest; otherwise only what was aborted can still finish.
-    finishing = pending if outcome == "failed" or (outcome == "settled" and bounded) else pending & aborted
-    if finishing:
-        await asyncio.wait(finishing, timeout=CLOSE_TIMEOUT)
+            logger.debug("connection did not close within %ss; aborting", CLOSE_TIMEOUT)
+    aborted = False
+    if transport is not None and not closed.done():
+        transport.abort()
+        aborted = True
+    # After a failure nothing has been waited for yet, and in a bounded session asyncio
+    # finishes the shutdown itself; otherwise only an abort can still end it.
+    if not closed.done() and (aborted or outcome == "failed" or (outcome == "settled" and bounded)):
+        await asyncio.wait({closed}, timeout=CLOSE_TIMEOUT)
     if cancelled is not None:
         raise cancelled
 
 
-def _abort(closing: Mapping[asyncio.Future[None], asyncio.Transport | None]) -> set[asyncio.Future[None]]:
-    """Abort every transport still closing, without waiting; return the futures of those aborted."""
-    aborted = set()
-    for future, transport in closing.items():
-        if transport is not None and not future.done():
-            transport.abort()
-            aborted.add(future)
-    return aborted
+def _retrieve(future: asyncio.Future[None]) -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 def _connector() -> aiohttp.TCPConnector:
