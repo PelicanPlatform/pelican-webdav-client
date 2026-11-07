@@ -20,7 +20,7 @@ A PROPFIND-only asynchronous WebDAV client for the Pelican Platform.
             print(resource.path, resource.is_collection, resource.size)
 """
 
-from .client import Client, Depth
+from .client import Client, Depth, trace_config
 from .exceptions import (
     ForbiddenError,
     InvalidResponseError,
@@ -43,4 +43,5 @@ __all__ = [
     "ResponseError",
     "UnauthorizedError",
     "WebDavError",
+    "trace_config",
 ]
