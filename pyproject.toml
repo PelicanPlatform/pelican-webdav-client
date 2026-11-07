@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pelican-webdav-client"
-version = "0.1.0"
+version = "0.1.2rc0"
 description = "A PROPFIND-only asynchronous WebDAV client for the Pelican Platform"
 readme = "README.md"
 license = "Apache-2.0"
